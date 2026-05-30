@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Hand Laser FX</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#000;overflow:hidden;width:100vw;height:100vh;font-family:'Courier New',monospace}
+  #video{position:fixed;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);z-index:1}
+  #canvas{position:fixed;top:0;left:0;width:100%;height:100%;z-index:2}
+  #hud{position:fixed;top:12px;left:12px;z-index:3;display:flex;flex-direction:column;gap:5px;pointer-events:none}
+  .s{background:rgba(0,0,0,0.6);border:1px solid rgba(0,255,180,0.4);color:#00ffc8;font-size:11px;padding:4px 8px;letter-spacing:.08em;text-transform:uppercase}
+  #tip{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.5);font-size:12px;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap;z-index:3;text-shadow:0 0 10px rgba(0,255,200,0.5)}
+  #overlay{position:fixed;inset:0;background:#000;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;color:rgba(255,255,255,0.6);font-size:13px;letter-spacing:.18em;text-transform:uppercase}
+  .dots{display:flex;gap:8px}
+  .dots span{width:7px;height:7px;border-radius:50%;background:#00ffc8;animation:blink 1.2s infinite}
+  .dots span:nth-child(2){animation-delay:.2s}
+  .dots span:nth-child(3){animation-delay:.4s}
+  @keyframes blink{0%,80%,100%{opacity:.15;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
+  #startBtn{display:none;margin-top:6px;padding:12px 32px;background:transparent;border:1px solid #00ffc8;color:#00ffc8;font-family:'Courier New',monospace;font-size:12px;letter-spacing:.2em;text-transform:uppercase;cursor:pointer;-webkit-tap-highlight-color:transparent}
+</style>
+</head>
+<body>
+<video id="video" autoplay muted playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="hud">
+  <div class="s" id="sh">Hands: 0</div>
+  <div class="s" id="sf">FPS: —</div>
+</div>
+<div id="tip">Show your hands</div>
+<div id="overlay">
+  <div class="dots"><span></span><span></span><span></span></div>
+  <span id="msg">Loading…</span>
+  <button id="startBtn" onclick="startCamera()">Tap to Start</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/hand-pose-detection@2.0.1/dist/hand-pose-detection.min.js"></script>
+<script>
+const video   = document.getElementById('video');
+const canvas  = document.getElementById('canvas');
+const ctx     = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const msg     = document.getElementById('msg');
+const sh      = document.getElementById('sh');
+const sf      = document.getElementById('sf');
+const tip     = document.getElementById('tip');
+const startBtn= document.getElementById('startBtn');
+
+const COLORS = ['#ff00ff','#00ffff','#ffff00','#ff4444','#00ff88','#ff8800','#cc88ff','#ffffff'];
+const TIPS   = [4,8,12,16,20];
+
+let detector = null;
+let running  = false;
+let frameCount=0, lastFpsT=performance.now();
+
+function resizeCanvas(){
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Scale keypoint from video coords to canvas coords
+// Video is mirrored via CSS so we mirror x here too
+function kpToCanvas(kp){
+  const vw = video.videoWidth  || 480;
+  const vh = video.videoHeight || 640;
+  const cw = canvas.width;
+  const ch = canvas.height;
+
+  // CSS uses object-fit:cover + scaleX(-1)
+  // We need to match that transform
+  const videoAspect  = vw / vh;
+  const canvasAspect = cw / ch;
+
+  let drawW, drawH, offX, offY;
+  if(videoAspect > canvasAspect){
+    drawH = ch; drawW = ch * videoAspect;
+    offX = (cw - drawW) / 2; offY = 0;
+  } else {
+    drawW = cw; drawH = cw / videoAspect;
+    offX = 0; offY = (ch - drawH) / 2;
+  }
+
+  // x is mirrored (CSS scaleX(-1) on video, canvas NOT mirrored)
+  const rx = kp.x / vw;
+  const ry = kp.y / vh;
+  const mx = 1 - rx; // mirror
+
+  return {
+    x: offX + mx * drawW,
+    y: offY + ry * drawH
+  };
+}
+
+function glowLine(x1,y1,x2,y2,col,w=3){
+  // Outer glow
+  ctx.save();
+  ctx.shadowColor=col; ctx.shadowBlur=30;
+  ctx.strokeStyle=col; ctx.lineWidth=w; ctx.globalAlpha=1;
+  ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  // Bright core
+  ctx.shadowBlur=8; ctx.strokeStyle='#ffffff'; ctx.lineWidth=w*0.3; ctx.globalAlpha=0.8;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.restore();
+}
+
+function glowDot(x,y,col,r=5){
+  ctx.save();
+  ctx.shadowColor=col; ctx.shadowBlur=25;
+  ctx.fillStyle=col; ctx.globalAlpha=1;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.shadowBlur=0; ctx.globalAlpha=0.9;
+  ctx.beginPath(); ctx.arc(x,y,r*0.4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawHand(kps){
+  const tips  = TIPS.map(i => kpToCanvas(kps[i]));
+  const wrist = kpToCanvas(kps[0]);
+
+  // Fan: wrist → each fingertip
+  tips.forEach((t,i) => glowLine(wrist.x,wrist.y,t.x,t.y,COLORS[i],3));
+  // Adjacent tip ring
+  for(let i=0;i<tips.length-1;i++)
+    glowLine(tips[i].x,tips[i].y,tips[i+1].x,tips[i+1].y,COLORS[(i+3)%8],2);
+  // Cross diagonals
+  [[0,2],[1,3],[0,4],[2,4],[1,4]].forEach(([a,b],i)=>
+    glowLine(tips[a].x,tips[a].y,tips[b].x,tips[b].y,COLORS[(i+5)%8],1.5));
+  // Dots at tips & wrist
+  tips.forEach((t,i)=>glowDot(t.x,t.y,COLORS[i],5));
+  glowDot(wrist.x,wrist.y,'#fff',6);
+}
+
+function drawPortal(kpsA,kpsB){
+  const tA=TIPS.map(i=>kpToCanvas(kpsA[i]));
+  const tB=TIPS.map(i=>kpToCanvas(kpsB[i]));
+  [[0,0],[1,1],[2,2],[3,3],[4,4],[0,4],[4,0]].forEach(([a,b],i)=>
+    glowLine(tA[a].x,tA[a].y,tB[b].x,tB[b].y,COLORS[(i+1)%8],1.8));
+}
+
+async function detect(){
+  if(!running) return;
+  resizeCanvas();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  let hands=[];
+  if(video.readyState>=2 && detector){
+    try{ hands = await detector.estimateHands(video,{flipHorizontal:false}); }
+    catch(e){}
+  }
+
+  sh.textContent=`Hands: ${hands.length}`;
+  tip.textContent = hands.length===0?'Show your hands to camera'
+    :hands.length===1?'Spread your fingers!'
+    :'Portal mode active!';
+
+  hands.forEach(h=>drawHand(h.keypoints));
+  if(hands.length>=2) drawPortal(hands[0].keypoints,hands[1].keypoints);
+
+  frameCount++;
+  const now=performance.now();
+  if(now-lastFpsT>800){
+    sf.textContent=`FPS: ${Math.round(frameCount/((now-lastFpsT)/1000))}`;
+    frameCount=0; lastFpsT=now;
+  }
+  requestAnimationFrame(detect);
+}
+
+async function startCamera(){
+  startBtn.style.display='none';
+  msg.textContent='Starting camera…';
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:'user', width:{ideal:1280}, height:{ideal:720} }
+    });
+    video.srcObject=stream;
+    await new Promise(r=>{video.onloadedmetadata=r;});
+    video.play();
+    msg.textContent='Loading AI model…';
+    resizeCanvas();
+
+    detector = await handPoseDetection.createDetector(
+      handPoseDetection.SupportedModels.MediaPipeHands,
+      { runtime:'tfjs', modelType:'lite', maxHands:2 }
+    );
+
+    overlay.style.display='none';
+    running=true;
+    detect();
+  }catch(e){
+    msg.textContent='Error: '+e.message;
+    msg.style.color='#ff4444';
+    startBtn.style.display='block';
+    startBtn.textContent='Retry';
+  }
+}
+
+// Try auto-start; show button after 1.5s if blocked
+const t=setTimeout(()=>{startBtn.style.display='block';msg.textContent='Tap to start';},1500);
+startCamera().then(()=>clearTimeout(t)).catch(()=>{clearTimeout(t);startBtn.style.display='block';});
+</script>
+</body>
+</html>
